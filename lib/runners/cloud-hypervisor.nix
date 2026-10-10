@@ -50,6 +50,7 @@ let
                   else userVSockCID;
   supportsNotifySocket = vsockCID != null;
   vsockPath = if userVSockPath != null then userVSockPath else "notify.vsock";
+  notifyRelaySocket = "${vsockPath}_sd";
   vsockOpts =
     if vsockCID == null then
       lib.warn "cloud-hypervisor supports systemd-notify via vsock, but `microvm.vsock.cid` must be set to enable this." ""
@@ -165,10 +166,19 @@ in {
 
   '' + lib.optionalString supportsNotifySocket ''
     # Ensure notify sockets are removed if cloud-hypervisor didn't exit cleanly the last time
-    rm -f ${vsockPath} ${vsockPath}_8888
+    rm -f ${vsockPath} ${vsockPath}_8888 ${lib.escapeShellArg notifyRelaySocket}
 
     # Start socat to forward systemd notify socket over vsock
     if [ -n "''${NOTIFY_SOCKET:-}" ]; then
+      # A forked sender may exit before systemd attributes its notification to
+      # this unit. Forward datagrams through a persistent, non-forking sender.
+      ${pkgs.socat}/bin/socat -u ${lib.escapeShellArg "UNIX-RECV:${notifyRelaySocket},mode=0600"} "UNIX-SENDTO:$NOTIFY_SOCKET" &
+      notify_relay_pid=$!
+      while [ ! -S ${lib.escapeShellArg notifyRelaySocket} ]; do
+        kill -0 "$notify_relay_pid"
+        sleep 0.01
+      done
+
       # Both timeouts must be short: since systemd v256, every sd_notify()
       # over an AF_VSOCK stream socket blocks in recv() until the peer
       # closes, and guest PID1 sends STATUS= notifications every 333ms while
@@ -183,7 +193,7 @@ in {
       # -T0.2: with cloud-hypervisor <= 52.0 the half-close is never
       #   propagated, so only this inactivity timeout closes the connection
       #   and delivers the EOF.
-      ${pkgs.socat}/bin/socat -t0 -T0.2 UNIX-LISTEN:${vsockPath}_8888,fork UNIX-SENDTO:$NOTIFY_SOCKET &
+      ${pkgs.socat}/bin/socat -t0 -T0.2 UNIX-LISTEN:${vsockPath}_8888,fork ${lib.escapeShellArg "UNIX-SENDTO:${notifyRelaySocket}"} &
     fi
   '' + lib.optionalString graphics.enable ''
     rm -f ${graphics.socket}
